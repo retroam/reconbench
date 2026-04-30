@@ -12,7 +12,7 @@ except ModuleNotFoundError:
 BASELINE_NOTE = (
     "Tewari et al. report 26.70-58.12% cardiomyocyte hypertrophy reaction "
     "reconstruction across GPT 4.1, Gemini 2.0, and Claude 3.7. The supplied "
-    "paper.md does not include per-model precision or F1 baselines."
+    "baseline text does not include per-model precision or F1 baselines."
 )
 
 
