@@ -1,0 +1,12 @@
+title: 'ReconBench: Signaling Network Reconstruction'
+description: |
+  Measures how accurately a language model reconstructs a cardiac hypertrophy
+  signaling network from signaling-node names alone.
+arxiv: https://doi.org/10.1101/2025.07.28.667217
+group: Knowledge
+contributors:
+  - local
+version: "1-A"
+tasks:
+  - name: reconbench
+    dataset_samples: 6

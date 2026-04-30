@@ -43,3 +43,10 @@ From Tewari et al. (2025), bare-model reconstruction recall on the hypertrophy n
 
 Precision and F1 are not reported in the paper; ReconBench adds both.
 
+## Roadmap
+
+**Phase 1 (current): Bare-model baseline**
+Replicate and extend Tewari et al. (2025) with precision and F1 scoring across current model versions.
+
+**Phase 2: Tool-augmented agents**
+Give agents access to biological databases (KEGG, STRING, Reactome) and measure whether tool use closes the reconstruction gap.
