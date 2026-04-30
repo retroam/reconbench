@@ -5,9 +5,19 @@ from typing import Any
 from inspect_ai.log import EvalLog, list_eval_logs, read_eval_log
 
 try:
-    from reconbench.reconbench import extract_reactions, load_ground_truth, score_reactions
+    from reconbench.reconbench import (
+        Reaction,
+        extract_reactions,
+        load_ground_truth,
+        score_reactions,
+    )
 except ModuleNotFoundError:
-    from reconbench import extract_reactions, load_ground_truth, score_reactions
+    from reconbench import (
+        Reaction,
+        extract_reactions,
+        load_ground_truth,
+        score_reactions,
+    )
 
 BASELINE_NOTE = (
     "Tewari et al. report 26.70-58.12% cardiomyocyte hypertrophy reaction "
@@ -16,24 +26,40 @@ BASELINE_NOTE = (
 )
 
 
+def _assistant_text(messages: list[Any]) -> str:
+    parts: list[str] = []
+    for message in messages or []:
+        if getattr(message, "role", None) != "assistant":
+            continue
+        text = getattr(message, "text", None) or ""
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
 def _epoch_counts(log: EvalLog) -> list[dict[str, int]]:
     ground_truth = load_ground_truth()
-    returned_by_epoch: dict[int, set[Reaction]] = {}
+    returned_by_run: dict[tuple[str, int], set[Reaction]] = {}
     samples = log.samples or []
     for sample in samples:
         epoch = getattr(sample, "epoch", 1) or 1
-        output = getattr(sample, "output", None)
-        if output is None or not output.completion:
-            continue
-        returned = returned_by_epoch.setdefault(epoch, set())
+        sample_id = str(getattr(sample, "id", "sample"))
         metadata = sample.metadata or {}
         nodes = metadata.get("nodes")
         if not isinstance(nodes, list):
             continue
-        returned.update(extract_reactions(output.completion, nodes))
+        text = _assistant_text(getattr(sample, "messages", []) or [])
+        if not text:
+            output = getattr(sample, "output", None)
+            text = getattr(output, "completion", "") if output else ""
+        if not text:
+            continue
+        key = (sample_id, epoch)
+        returned = returned_by_run.setdefault(key, set())
+        returned.update(extract_reactions(text, nodes))
 
     counts = []
-    for returned in returned_by_epoch.values():
+    for returned in returned_by_run.values():
         scored = score_reactions(returned, ground_truth)
         counts.append(
             {

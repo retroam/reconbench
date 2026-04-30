@@ -1,26 +1,39 @@
 import csv
 import json
 import re
+from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from inspect_ai import Task, task
 from inspect_ai.dataset import MemoryDataset, Sample
+from inspect_ai.model import ChatMessageAssistant, ChatMessageUser
 from inspect_ai.scorer import Metric, SampleScore, Score, Scorer, Target, metric, scorer
-from inspect_ai.solver import TaskState, generate
+from inspect_ai.solver import Generate, Solver, TaskState, solver
 
 DATA_DIR = Path(__file__).parent
 REACTIONS_CSV = DATA_DIR / "data" / "reactions.csv"
 SPECIES_CSV = DATA_DIR / "data" / "species.csv"
 
 BATCH_SIZE = 20
-PROMPT_TEMPLATE = (
-    "List of genes and other signaling nodes: {gene_list}. "
-    "For these genes from a cardiac hypertrophy network, provide direct "
-    "interactions between them supported by literature. For each interaction, "
-    "state: input node, affected node, and whether the affected node is "
-    "stimulated or inhibited. Only include interactions between genes in the list."
+DEFAULT_PHENOTYPE = "cardiac hypertrophy"
+
+# Per Tewari et al. 2025 (Methods, "Querying Large Language Models").
+# Step 1 (gene list) + Step 2 (batch-1 instruction) are sent as the first
+# user message; Step 3 (continuation) is a separate user message per chunk.
+INITIAL_PROMPT_TEMPLATE = (
+    "List of genes and other signaling nodes: {gene_list}\n\n"
+    "For the first {batch_size} entries in this list of genes, proteins, and "
+    "other signaling nodes from a {phenotype} network, please provide more "
+    "than 0 but fewer than {max_connections} direct interactions with other "
+    "nodes from the list supported by available literature. Simply list the "
+    "input node, affected node, and if the affected node is stimulated / "
+    "inhibited."
+)
+CONTINUATION_PROMPT_TEMPLATE = (
+    "That looks great! Please do the same operation for the next "
+    "{chunk_size} nodes! Thank you"
 )
 
 STIMULATES = {
@@ -64,7 +77,7 @@ INTERACTION_RE = re.compile(
     flags=re.IGNORECASE,
 )
 ARROW_RE = re.compile(
-    r"(?P<src>[A-Za-z0-9_./+!-]+)\s*(?:->|=>|\u2192)\s*"
+    r"(?P<src>[A-Za-z0-9_./+!-]+)\s*(?P<op>->|=>|=\||\u2192)\s*"
     r"(?P<dst>[A-Za-z0-9_./+!-]+)"
     r"(?P<context>[^\n]{0,120})",
     flags=re.IGNORECASE,
@@ -129,12 +142,39 @@ def load_ground_truth(path: Path = REACTIONS_CSV) -> set[Reaction]:
     return reactions
 
 
+def compute_max_connections(reactions: Iterable[Reaction]) -> int:
+    """Maximum out-degree exhibited by any source node in the ground truth.
+
+    Tewari et al. set ``max_connections`` to "the maximum number of connections
+    exhibited in that parent network" (Methods); we interpret this as the
+    largest number of outgoing signed edges from any single node.
+    """
+    counts: Counter[str] = Counter()
+    for reaction in reactions:
+        counts[reaction.source] += 1
+    return max(counts.values()) if counts else 0
+
+
 def make_batches(nodes: Sequence[str], batch_size: int = BATCH_SIZE) -> list[list[str]]:
     return [list(nodes[i : i + batch_size]) for i in range(0, len(nodes), batch_size)]
 
 
-def make_prompt(nodes: Sequence[str]) -> str:
-    return PROMPT_TEMPLATE.format(gene_list=", ".join(nodes))
+def make_initial_prompt(
+    nodes: Sequence[str],
+    batch_size: int,
+    phenotype: str,
+    max_connections: int,
+) -> str:
+    return INITIAL_PROMPT_TEMPLATE.format(
+        gene_list=", ".join(nodes),
+        batch_size=batch_size,
+        phenotype=phenotype,
+        max_connections=max_connections,
+    )
+
+
+def make_continuation_prompt(chunk_size: int) -> str:
+    return CONTINUATION_PROMPT_TEMPLATE.format(chunk_size=chunk_size)
 
 
 def extract_reactions(text: str, allowed_nodes: Iterable[str] | None = None) -> set[Reaction]:
@@ -154,7 +194,7 @@ def extract_reactions(text: str, allowed_nodes: Iterable[str] | None = None) -> 
         target = _clean_node(match.group("dst"))
         if allowed is not None and (source not in allowed or target not in allowed):
             continue
-        effect = _effect_from_text(match.group("context"))
+        effect = _effect_from_arrow(match.group("op"), match.group("context"))
         if effect:
             reactions.add(Reaction(source=source, target=target, effect=effect))
 
@@ -201,6 +241,17 @@ def _effect_from_text(text: str) -> str | None:
     if any(verb in normalized for verb in STIMULATES) or any(
         word in normalized for word in ["stimulation", "activation"]
     ):
+        return "stimulated"
+    return None
+
+
+def _effect_from_arrow(operator: str, context: str) -> str | None:
+    if operator == "=|":
+        return "inhibited"
+    contextual = _effect_from_text(context)
+    if contextual:
+        return contextual
+    if operator in {"=>", "->", "\u2192"}:
         return "stimulated"
     return None
 
@@ -299,19 +350,48 @@ def _aggregate_counts(scores: Sequence[SampleScore]) -> dict[str, int]:
     return counts
 
 
+def transcript_text(state: TaskState) -> str:
+    """Concatenate every assistant turn from the conversation."""
+    parts: list[str] = []
+    for message in state.messages:
+        if isinstance(message, ChatMessageAssistant):
+            text = getattr(message, "text", None) or ""
+            if text:
+                parts.append(text)
+    return "\n\n".join(parts)
+
+
+@solver
+def reconbench_solver() -> Solver:
+    """Three-step iterative prompt from Tewari et al. (2025).
+
+    Sends the gene list + first-batch instruction as one user message, then
+    issues the continuation prompt once per remaining chunk, generating after
+    each turn so the assistant accumulates outputs across the conversation.
+    """
+
+    async def solve(state: TaskState, generate: Generate) -> TaskState:
+        chunks = state.metadata.get("chunks") or []
+        await generate(state)
+        for chunk in chunks[1:]:
+            state.messages.append(
+                ChatMessageUser(content=make_continuation_prompt(len(chunk)))
+            )
+            await generate(state)
+        return state
+
+    return solve
+
+
 @scorer(metrics=[reaction_recall(), precision(), f1()])
 def reconbench_scorer() -> Scorer:
     ground_truth = load_ground_truth()
 
     async def score(state: TaskState, target: Target) -> Score:
-        allowed_nodes = state.metadata["nodes"]
-        returned = extract_reactions(state.output.completion, allowed_nodes)
-        batch_ground_truth = {
-            reaction
-            for reaction in ground_truth
-            if reaction.source in allowed_nodes and reaction.target in allowed_nodes
-        }
-        value = score_reactions(returned, batch_ground_truth)
+        nodes = state.metadata["nodes"]
+        text = transcript_text(state)
+        returned = extract_reactions(text, nodes)
+        value = score_reactions(returned, ground_truth)
         return Score(
             value={
                 "recall": value["recall"],
@@ -326,15 +406,33 @@ def reconbench_scorer() -> Scorer:
 
 
 @task
-def reconbench(batch_size: int = BATCH_SIZE) -> Task:
+def reconbench(
+    phenotype: str = DEFAULT_PHENOTYPE,
+    batch_size: int = BATCH_SIZE,
+) -> Task:
     nodes = load_species()
-    samples = [
-        Sample(
-            id=f"batch-{i + 1:02d}",
-            input=make_prompt(batch),
-            target="",
-            metadata={"nodes": batch},
-        )
-        for i, batch in enumerate(make_batches(nodes, batch_size=batch_size))
-    ]
-    return Task(dataset=MemoryDataset(samples), solver=generate(), scorer=reconbench_scorer())
+    ground_truth = load_ground_truth()
+    chunks = make_batches(nodes, batch_size=batch_size)
+    max_connections = compute_max_connections(ground_truth)
+    initial_prompt = make_initial_prompt(
+        nodes=nodes,
+        batch_size=len(chunks[0]) if chunks else batch_size,
+        phenotype=phenotype,
+        max_connections=max_connections,
+    )
+    sample = Sample(
+        id=phenotype.replace(" ", "_"),
+        input=initial_prompt,
+        target="",
+        metadata={
+            "nodes": nodes,
+            "chunks": chunks,
+            "phenotype": phenotype,
+            "max_connections": max_connections,
+        },
+    )
+    return Task(
+        dataset=MemoryDataset([sample]),
+        solver=reconbench_solver(),
+        scorer=reconbench_scorer(),
+    )

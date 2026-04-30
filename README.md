@@ -6,6 +6,18 @@ Here's a clean README:
 
 ReconBench measures whether a frontier model can reconstruct a cardiac signaling network from a gene list alone — no pathway descriptions, no interaction hints. It replicates the bare-model baseline from Tewari et al. (2025) and extends it with precision and F1 scoring.
 
+## Methodology
+
+Faithful to Tewari et al. (2025) Methods, "Querying Large Language Models":
+
+- **One sample per network.** The full gene list is provided once per run.
+- **Three-step iterative prompt** in a single multi-turn conversation:
+  1. `List of genes and other signaling nodes: {gene_list}`
+  2. `For the first {batch_size} entries ... please provide more than 0 but fewer than {max_connections} direct interactions ...`
+  3. `That looks great! Please do the same operation for the next {chunk_size} nodes! Thank you` — repeated for each remaining 20-node chunk.
+- `max_connections` is the maximum out-degree of any source node in the manually-curated network.
+- Reactions are extracted from the **entire transcript** (all assistant turns) and compared to the **full** ground-truth reaction list.
+
 ## Data
 
 Two files are required, exported from `Ryall2012_cardiomyocyte_hypertrophy.xlsx` (available at [saucermanlab/Netflux2](https://github.com/saucermanlab/Netflux2/blob/main/models/Ryall2012_cardiomyocyte_hypertrophy.xlsx)):
@@ -15,7 +27,7 @@ Two files are required, exported from `Ryall2012_cardiomyocyte_hypertrophy.xlsx`
 
 ## Running
 
-Run 10 epochs per model:
+Each Inspect epoch is one full multi-turn run; use `--epochs 10` for the paper's 10-runs-per-network protocol:
 
 ```bash
 uv run --project inspect_evals inspect eval reconbench/reconbench.py@reconbench --model openai/gpt-4.1 --epochs 10 --log-dir reconbench/logs/gpt-4.1
