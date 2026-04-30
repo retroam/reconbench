@@ -1,10 +1,18 @@
-Here's a clean README:
-
----
-
 # ReconBench
 
 ReconBench measures whether a frontier model can reconstruct a cardiac signaling network from a gene list alone — no pathway descriptions, no interaction hints. It replicates the bare-model baseline from Tewari et al. (2025) and extends it with precision and F1 scoring.
+
+## Methodology
+
+Faithful to Tewari et al. (2025) Methods, "Querying Large Language Models":
+
+- **One sample per network.** The full gene list is provided once per run.
+- **Three-step iterative prompt** in a single multi-turn conversation:
+  1. `List of genes and other signaling nodes: {gene_list}`
+  2. `For the first {batch_size} entries ... please provide more than 0 but fewer than {max_connections} direct interactions ...`
+  3. `That looks great! Please do the same operation for the next {chunk_size} nodes! Thank you` — repeated for each remaining 20-node chunk.
+- `max_connections` is the maximum out-degree of any source node in the manually-curated network.
+- Reactions are extracted from the **entire transcript** (all assistant turns) and compared to the **full** ground-truth reaction list.
 
 ## Data
 
@@ -15,7 +23,7 @@ Two files are required, exported from `Ryall2012_cardiomyocyte_hypertrophy.xlsx`
 
 ## Running
 
-Run 10 epochs per model:
+Each Inspect epoch is one full multi-turn run; use `--epochs 10` for the paper's 10-runs-per-network protocol:
 
 ```bash
 uv run --project inspect_evals inspect eval reconbench/reconbench.py@reconbench --model openai/gpt-4.1 --epochs 10 --log-dir reconbench/logs/gpt-4.1
@@ -42,6 +50,18 @@ From Tewari et al. (2025), bare-model reconstruction recall on the hypertrophy n
 | Gemini 2.0 | ~27% |
 
 Precision and F1 are not reported in the paper; ReconBench adds both.
+
+## Results (10 epochs via OpenRouter, 2026-04-30)
+
+| Model | Recall | Precision | F1 |
+|---|---:|---:|---:|
+| Claude 3.7 Sonnet | 57.2% | 50.5% | 53.7% |
+| GPT-4.1 | 24.4% | 29.5% | 26.7% |
+| Gemini 2.0 Flash | 0.2% | 44.4% | 0.4% |
+
+Claude 3.7 matches the paper baseline (~58%). GPT-4.1 underperforms the paper (~45%). Gemini 2.0's near-zero recall with non-trivial precision points to an extraction-format mismatch rather than a model failure — the regex extractor likely does not catch Gemini's output style.
+
+See [`notebooks/scout_analysis.ipynb`](notebooks/scout_analysis.ipynb) for an [Inspect Scout](https://meridianlabs-ai.github.io/inspect_scout/) walkthrough of these logs that confirms Gemini emits CSV-tuple format (`X, Y, Stimulated`) instead of the paper's `X stimulates Y` prose, which the bench's regex doesn't catch.
 
 ## Roadmap
 

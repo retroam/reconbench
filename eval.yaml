@@ -6,7 +6,7 @@ arxiv: https://doi.org/10.1101/2025.07.28.667217
 group: Knowledge
 contributors:
   - local
-version: "1-A"
+version: "2-A"
 tasks:
   - name: reconbench
-    dataset_samples: 6
+    dataset_samples: 1

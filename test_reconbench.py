@@ -1,9 +1,15 @@
 from reconbench.reconbench import (
+    BATCH_SIZE,
+    DEFAULT_PHENOTYPE,
     Reaction,
+    compute_max_connections,
     extract_reactions,
     load_ground_truth,
     load_species,
     make_batches,
+    make_continuation_prompt,
+    make_initial_prompt,
+    reconbench,
     score_reactions,
 )
 
@@ -27,6 +33,44 @@ def test_make_batches() -> None:
     assert len(batches) == 6
     assert len(batches[0]) == 20
     assert len(batches[-1]) == 6
+
+
+def test_compute_max_connections() -> None:
+    reactions = {
+        Reaction("A", "B", "stimulated"),
+        Reaction("A", "C", "stimulated"),
+        Reaction("A", "D", "inhibited"),
+        Reaction("B", "C", "stimulated"),
+    }
+    assert compute_max_connections(reactions) == 3
+    assert compute_max_connections(set()) == 0
+
+
+def test_compute_max_connections_on_real_data() -> None:
+    assert compute_max_connections(load_ground_truth()) > 0
+
+
+def test_make_initial_prompt_contains_paper_phrasing() -> None:
+    prompt = make_initial_prompt(
+        nodes=["A", "B", "C"],
+        batch_size=2,
+        phenotype="cardiac hypertrophy",
+        max_connections=7,
+    )
+    assert "List of genes and other signaling nodes:" in prompt
+    assert "A, B, C" in prompt
+    assert "For the first 2 entries" in prompt
+    assert "cardiac hypertrophy" in prompt
+    assert "fewer than 7 direct interactions" in prompt
+    assert "stimulated / inhibited" in prompt
+
+
+def test_make_continuation_prompt_uses_paper_phrasing() -> None:
+    prompt = make_continuation_prompt(6)
+    assert prompt == (
+        "That looks great! Please do the same operation for the next "
+        "6 nodes! Thank you"
+    )
 
 
 def test_extract_reactions_with_synonyms_and_node_filter() -> None:
@@ -67,6 +111,16 @@ def test_extract_reactions_with_synonyms_and_node_filter() -> None:
     }
 
 
+def test_extract_reactions_handles_arrow_operators() -> None:
+    reactions = extract_reactions(
+        "A => B\nC =| D\nE -> F",
+        allowed_nodes={"A", "B", "C", "D", "E", "F"},
+    )
+    assert Reaction("A", "B", "stimulated") in reactions
+    assert Reaction("C", "D", "inhibited") in reactions
+    assert Reaction("E", "F", "stimulated") in reactions
+
+
 def test_score_reactions() -> None:
     ground_truth = {
         Reaction("A", "B", "stimulated"),
@@ -80,3 +134,19 @@ def test_score_reactions() -> None:
     assert score["recall"] == 0.5
     assert score["precision"] == 0.5
     assert score["f1"] == 0.5
+
+
+def test_task_constructs_single_full_network_sample() -> None:
+    task = reconbench()
+    samples = list(task.dataset)
+    assert len(samples) == 1
+    sample = samples[0]
+    metadata = sample.metadata or {}
+    assert metadata["phenotype"] == DEFAULT_PHENOTYPE
+    assert len(metadata["nodes"]) == 106
+    chunks = metadata["chunks"]
+    assert len(chunks) == 6
+    assert len(chunks[0]) == BATCH_SIZE
+    assert metadata["max_connections"] > 0
+    assert "List of genes and other signaling nodes:" in sample.input
+    assert f"fewer than {metadata['max_connections']}" in sample.input
