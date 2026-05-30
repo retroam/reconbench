@@ -8,6 +8,7 @@ try:
     from reconbench.reconbench import (
         Reaction,
         extract_reactions,
+        extract_structured_reactions,
         load_ground_truth,
         score_reactions,
     )
@@ -15,6 +16,7 @@ except ModuleNotFoundError:
     from reconbench import (
         Reaction,
         extract_reactions,
+        extract_structured_reactions,
         load_ground_truth,
         score_reactions,
     )
@@ -37,9 +39,10 @@ def _assistant_text(messages: list[Any]) -> str:
     return "\n\n".join(parts)
 
 
-def _epoch_counts(log: EvalLog) -> list[dict[str, int]]:
+def _epoch_counts(log: EvalLog) -> list[dict[str, int | str]]:
     ground_truth = load_ground_truth()
     returned_by_run: dict[tuple[str, int], set[Reaction]] = {}
+    conditions_by_run: dict[tuple[str, int], str] = {}
     samples = log.samples or []
     for sample in samples:
         epoch = getattr(sample, "epoch", 1) or 1
@@ -55,14 +58,20 @@ def _epoch_counts(log: EvalLog) -> list[dict[str, int]]:
         if not text:
             continue
         key = (sample_id, epoch)
+        output_format = metadata.get("output_format", "freeform")
+        conditions_by_run[key] = str(metadata.get("condition", output_format))
         returned = returned_by_run.setdefault(key, set())
-        returned.update(extract_reactions(text, nodes))
+        if output_format == "structured":
+            returned.update(extract_structured_reactions(text, nodes))
+        else:
+            returned.update(extract_reactions(text, nodes))
 
     counts = []
-    for returned in returned_by_run.values():
+    for key, returned in returned_by_run.items():
         scored = score_reactions(returned, ground_truth)
         counts.append(
             {
+                "condition": conditions_by_run.get(key, "freeform"),
                 "true_positive_count": int(scored["true_positive_count"]),
                 "returned_count": int(scored["returned_count"]),
                 "ground_truth_count": int(scored["ground_truth_count"]),
@@ -103,34 +112,42 @@ def summarize(log_dir: Path) -> list[dict[str, Any]]:
         if getattr(log.eval, "task", None) != "reconbench":
             continue
         model = _model_name(log)
-        model_row = rows_by_model.setdefault(
-            model,
-            {
-                "model": model,
-                "runs": 0,
-                "true_positive_count": 0,
-                "returned_count": 0,
-                "ground_truth_count": 0,
-            },
-        )
         for counts in _epoch_counts(log):
+            condition = str(counts.get("condition", "freeform"))
+            model_row = rows_by_model.setdefault(
+                f"{model}|{condition}",
+                {
+                    "model": model,
+                    "condition": condition,
+                    "runs": 0,
+                    "true_positive_count": 0,
+                    "returned_count": 0,
+                    "ground_truth_count": 0,
+                },
+            )
             model_row["runs"] += 1
-            for key, value in counts.items():
-                model_row[key] += value
+            for key in [
+                "true_positive_count",
+                "returned_count",
+                "ground_truth_count",
+            ]:
+                value = counts.get(key)
+                if isinstance(value, int):
+                    model_row[key] += value
 
     rows = []
     for row in rows_by_model.values():
         metrics = _metrics(row)
         rows.append({**row, **metrics})
-    return sorted(rows, key=lambda row: row["model"])
+    return sorted(rows, key=lambda row: (row["model"], row["condition"]))
 
 
 def print_markdown(rows: list[dict[str, Any]]) -> None:
-    print("| Model | Runs | Recall | Precision | F1 |")
-    print("| --- | ---: | ---: | ---: | ---: |")
+    print("| Model | Condition | Runs | Recall | Precision | F1 |")
+    print("| --- | --- | ---: | ---: | ---: | ---: |")
     for row in rows:
         print(
-            f"| {row['model']} | {row['runs']} | "
+            f"| {row['model']} | {row['condition']} | {row['runs']} | "
             f"{row['recall']:.2%} | {row['precision']:.2%} | {row['f1']:.2%} |"
         )
     print()
