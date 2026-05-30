@@ -31,13 +31,19 @@ uv run --project inspect_evals inspect eval reconbench/reconbench.py@reconbench 
 uv run --project inspect_evals inspect eval reconbench/reconbench.py@reconbench --model google/gemini-2.0-flash --epochs 10 --log-dir reconbench/logs/gemini-2.0
 ```
 
+Phase 2 structured-output runs keep the same prompt scaffold but require JSON reactions instead of free-form prose:
+
+```bash
+uv run --project inspect_evals inspect eval reconbench/reconbench.py@reconbench --model openai/gpt-4.1 --epochs 10 --log-dir reconbench/logs/gpt-4.1-structured -T output_format=structured
+```
+
 ## Reporting
 
 ```bash
 uv run --project inspect_evals python reconbench/report.py reconbench/logs
 ```
 
-Prints per-model recall, precision, and F1 across all runs.
+Prints recall, precision, and F1 across all runs, grouped by model and condition.
 
 ## Baseline
 
@@ -51,7 +57,7 @@ From Tewari et al. (2025), bare-model reconstruction recall on the hypertrophy n
 
 Precision and F1 are not reported in the paper; ReconBench adds both.
 
-## Results (10 epochs via OpenRouter, 2026-04-30)
+## Original results (10 epochs via OpenRouter, 2026-04-30)
 
 | Model | Recall | Precision | F1 |
 |---|---:|---:|---:|
@@ -59,9 +65,11 @@ Precision and F1 are not reported in the paper; ReconBench adds both.
 | GPT-4.1 | 24.4% | 29.5% | 26.7% |
 | Gemini 2.0 Flash | 0.2% | 44.4% | 0.4% |
 
-Claude 3.7 matches the paper baseline (~58%). GPT-4.1 underperforms the paper (~45%). Gemini 2.0's near-zero recall with non-trivial precision points to an extraction-format mismatch rather than a model failure — the regex extractor likely does not catch Gemini's output style.
+Claude 3.7 matched the paper baseline (~58%). GPT-4.1 underperformed the paper (~45%). Gemini 2.0's near-zero recall with non-trivial precision pointed to an extraction-format mismatch rather than a model failure — the original regex extractor did not catch Gemini's output style.
 
 See [`notebooks/scout_analysis.ipynb`](notebooks/scout_analysis.ipynb) for an [Inspect Scout](https://meridianlabs-ai.github.io/inspect_scout/) walkthrough of these logs that confirms Gemini emits CSV-tuple format (`X, Y, Stimulated`) instead of the paper's `X stimulates Y` prose, which the bench's regex doesn't catch.
+
+The extractor now handles these CSV tuples, and Phase 2 can avoid this class of bug by running with `output_format=structured`.
 
 ## Roadmap
 

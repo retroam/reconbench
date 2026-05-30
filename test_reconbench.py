@@ -4,6 +4,7 @@ from reconbench.reconbench import (
     Reaction,
     compute_max_connections,
     extract_reactions,
+    extract_structured_reactions,
     load_ground_truth,
     load_species,
     make_batches,
@@ -73,6 +74,15 @@ def test_make_continuation_prompt_uses_paper_phrasing() -> None:
     )
 
 
+def test_make_structured_continuation_prompt_repeats_json_instruction() -> None:
+    prompt = make_continuation_prompt(6, structured_output=True)
+    assert prompt.startswith(
+        "That looks great! Please do the same operation for the next "
+        "6 nodes! Thank you"
+    )
+    assert "Return only valid JSON" in prompt
+
+
 def test_extract_reactions_with_synonyms_and_node_filter() -> None:
     text = """
     EGF activates EGFR.
@@ -121,6 +131,49 @@ def test_extract_reactions_handles_arrow_operators() -> None:
     assert Reaction("E", "F", "stimulated") in reactions
 
 
+def test_extract_reactions_handles_csv_tuples() -> None:
+    reactions = extract_reactions(
+        """
+        source, target, effect
+        ADRB2, RAC1, Stimulated
+        ADRB2, ADCY, Stimulated
+        RAC1, MAP3K1, Inhibited
+        Outside, RAC1, Stimulated
+        """,
+        allowed_nodes={"ADRB2", "RAC1", "ADCY", "MAP3K1"},
+    )
+    assert reactions == {
+        Reaction("ADRB2", "RAC1", "stimulated"),
+        Reaction("ADRB2", "ADCY", "stimulated"),
+        Reaction("RAC1", "MAP3K1", "inhibited"),
+    }
+
+
+def test_extract_structured_reactions_handles_json_object_and_filters_nodes() -> None:
+    reactions = extract_structured_reactions(
+        '{"reactions":['
+        '{"source":"ADRB2","target":"RAC1","effect":"stimulated"},'
+        '{"source":"RAC1","target":"MAP3K1","effect":"inhibited"},'
+        '{"source":"Outside","target":"MAP3K1","effect":"stimulated"}'
+        "]}",
+        allowed_nodes={"ADRB2", "RAC1", "MAP3K1"},
+    )
+    assert reactions == {
+        Reaction("ADRB2", "RAC1", "stimulated"),
+        Reaction("RAC1", "MAP3K1", "inhibited"),
+    }
+
+
+def test_extract_structured_reactions_handles_json_array_in_fence() -> None:
+    reactions = extract_structured_reactions(
+        """```json
+        [{"source":"A","target":"B","effect":"activation"}]
+        ```""",
+        allowed_nodes={"A", "B"},
+    )
+    assert reactions == {Reaction("A", "B", "stimulated")}
+
+
 def test_score_reactions() -> None:
     ground_truth = {
         Reaction("A", "B", "stimulated"),
@@ -150,3 +203,13 @@ def test_task_constructs_single_full_network_sample() -> None:
     assert metadata["max_connections"] > 0
     assert "List of genes and other signaling nodes:" in sample.input
     assert f"fewer than {metadata['max_connections']}" in sample.input
+
+
+def test_task_can_request_structured_output() -> None:
+    task = reconbench(output_format="structured")
+    sample = list(task.dataset)[0]
+    metadata = sample.metadata or {}
+    assert metadata["output_format"] == "structured"
+    assert metadata["condition"] == "structured"
+    assert "Return only valid JSON" in sample.input
+    assert '"reactions"' in sample.input

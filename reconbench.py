@@ -35,6 +35,13 @@ CONTINUATION_PROMPT_TEMPLATE = (
     "That looks great! Please do the same operation for the next "
     "{chunk_size} nodes! Thank you"
 )
+STRUCTURED_OUTPUT_INSTRUCTIONS = (
+    "\n\nReturn only valid JSON. Use this schema exactly: "
+    '{"reactions":[{"source":"NODE","target":"NODE",'
+    '"effect":"stimulated|inhibited"}]}. '
+    "Every source and target must be copied exactly from the provided node list. "
+    "Do not include markdown fences or explanatory prose."
+)
 
 STIMULATES = {
     "stimulate",
@@ -164,17 +171,24 @@ def make_initial_prompt(
     batch_size: int,
     phenotype: str,
     max_connections: int,
+    structured_output: bool = False,
 ) -> str:
-    return INITIAL_PROMPT_TEMPLATE.format(
+    prompt = INITIAL_PROMPT_TEMPLATE.format(
         gene_list=", ".join(nodes),
         batch_size=batch_size,
         phenotype=phenotype,
         max_connections=max_connections,
     )
+    if structured_output:
+        prompt += STRUCTURED_OUTPUT_INSTRUCTIONS
+    return prompt
 
 
-def make_continuation_prompt(chunk_size: int) -> str:
-    return CONTINUATION_PROMPT_TEMPLATE.format(chunk_size=chunk_size)
+def make_continuation_prompt(chunk_size: int, structured_output: bool = False) -> str:
+    prompt = CONTINUATION_PROMPT_TEMPLATE.format(chunk_size=chunk_size)
+    if structured_output:
+        prompt += STRUCTURED_OUTPUT_INSTRUCTIONS
+    return prompt
 
 
 def extract_reactions(text: str, allowed_nodes: Iterable[str] | None = None) -> set[Reaction]:
@@ -213,6 +227,23 @@ def extract_reactions(text: str, allowed_nodes: Iterable[str] | None = None) -> 
         if effect:
             reactions.add(Reaction(source=source, target=target, effect=effect))
 
+    for line in text.splitlines():
+        if "," not in line:
+            continue
+        cells = [_clean_cell(cell) for cell in line.split(",")]
+        if len(cells) < 3:
+            continue
+        source, target, effect_text = cells[:3]
+        if source.lower() in {"input node", "input", "source"}:
+            continue
+        if target.lower() in {"affected node", "target"}:
+            continue
+        if allowed is not None and (source not in allowed or target not in allowed):
+            continue
+        effect = _effect_from_text(effect_text)
+        if effect:
+            reactions.add(Reaction(source=source, target=target, effect=effect))
+
     for match in FIELD_RE.finditer(text):
         source = _clean_node(match.group("src"))
         target = _clean_node(match.group("dst"))
@@ -222,6 +253,55 @@ def extract_reactions(text: str, allowed_nodes: Iterable[str] | None = None) -> 
         if effect:
             reactions.add(Reaction(source=source, target=target, effect=effect))
     return reactions
+
+
+def extract_structured_reactions(
+    text: str, allowed_nodes: Iterable[str] | None = None
+) -> set[Reaction]:
+    """Extract reactions from JSON outputs requested by the structured protocol."""
+    allowed = set(allowed_nodes) if allowed_nodes is not None else None
+    reactions: set[Reaction] = set()
+    for value in _iter_json_values(text):
+        for item in _iter_reaction_items(value):
+            if not isinstance(item, dict):
+                continue
+            source = _clean_node(str(item.get("source", "")))
+            target = _clean_node(str(item.get("target", "")))
+            effect = _effect_from_text(str(item.get("effect", "")))
+            if not source or not target or not effect:
+                continue
+            if allowed is not None and (source not in allowed or target not in allowed):
+                continue
+            reactions.add(Reaction(source=source, target=target, effect=effect))
+    return reactions
+
+
+def _iter_json_values(text: str) -> Iterable[object]:
+    decoder = json.JSONDecoder()
+    index = 0
+    while index < len(text):
+        start_candidates = [pos for pos in (text.find("{", index), text.find("[", index)) if pos != -1]
+        if not start_candidates:
+            break
+        start = min(start_candidates)
+        try:
+            value, end = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            index = start + 1
+            continue
+        yield value
+        index = start + end
+
+
+def _iter_reaction_items(value: object) -> Iterable[object]:
+    if isinstance(value, list):
+        yield from value
+    elif isinstance(value, dict):
+        reactions = value.get("reactions")
+        if isinstance(reactions, list):
+            yield from reactions
+        else:
+            yield value
 
 
 def _clean_cell(text: str) -> str:
@@ -372,10 +452,15 @@ def reconbench_solver() -> Solver:
 
     async def solve(state: TaskState, generate: Generate) -> TaskState:
         chunks = state.metadata.get("chunks") or []
+        structured_output = state.metadata.get("output_format") == "structured"
         await generate(state)
         for chunk in chunks[1:]:
             state.messages.append(
-                ChatMessageUser(content=make_continuation_prompt(len(chunk)))
+                ChatMessageUser(
+                    content=make_continuation_prompt(
+                        len(chunk), structured_output=structured_output
+                    )
+                )
             )
             await generate(state)
         return state
@@ -390,7 +475,11 @@ def reconbench_scorer() -> Scorer:
     async def score(state: TaskState, target: Target) -> Score:
         nodes = state.metadata["nodes"]
         text = transcript_text(state)
-        returned = extract_reactions(text, nodes)
+        output_format = state.metadata.get("output_format", "freeform")
+        if output_format == "structured":
+            returned = extract_structured_reactions(text, nodes)
+        else:
+            returned = extract_reactions(text, nodes)
         value = score_reactions(returned, ground_truth)
         return Score(
             value={
@@ -409,7 +498,10 @@ def reconbench_scorer() -> Scorer:
 def reconbench(
     phenotype: str = DEFAULT_PHENOTYPE,
     batch_size: int = BATCH_SIZE,
+    output_format: str = "freeform",
 ) -> Task:
+    if output_format not in {"freeform", "structured"}:
+        raise ValueError("output_format must be 'freeform' or 'structured'")
     nodes = load_species()
     ground_truth = load_ground_truth()
     chunks = make_batches(nodes, batch_size=batch_size)
@@ -419,6 +511,7 @@ def reconbench(
         batch_size=len(chunks[0]) if chunks else batch_size,
         phenotype=phenotype,
         max_connections=max_connections,
+        structured_output=output_format == "structured",
     )
     sample = Sample(
         id=phenotype.replace(" ", "_"),
@@ -429,6 +522,8 @@ def reconbench(
             "chunks": chunks,
             "phenotype": phenotype,
             "max_connections": max_connections,
+            "output_format": output_format,
+            "condition": output_format,
         },
     )
     return Task(
